@@ -105,7 +105,9 @@ def _swa_math(
     decay_rate,
     n_averaged,
 ):
-    if n_averaged == 0:
+    # NOTE: As we have increased `n_averaged` before the Triton kernel invocation, the condition
+    # here is different from the origin PyTorch SWA, but they are equivalent.
+    if n_averaged <= 1:
         swa_param = param
     else:
         swa_param += (1.0 - decay_rate) * (param - swa_param)
@@ -120,6 +122,8 @@ def _multi_tensor_adam_swa(
     grad_ptr_per_chunk,
     moment_ptr_per_chunk,
     velocity_ptr_per_chunk,
+    step_ptr_per_chunk,
+    swa_n_averaged_ptr_per_chunk,
     chunk_local_idx_ptr,
     chunk_numel_ptr,
     grad_clip_scale_ptr,
@@ -128,11 +132,9 @@ def _multi_tensor_adam_swa(
     beta2,
     eps,
     weight_decay,
-    beta1_correction,
-    beta2_correction,
     swa_decay_rate,
-    swa_n_averaged,
     adam_math_mode: tl.constexpr,
+    bias_correction: tl.constexpr,
     MODEL_COMPUTE_DTYPE: tl.constexpr,
     MODEL_STATE_DTYPE: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
@@ -146,6 +148,7 @@ def _multi_tensor_adam_swa(
     compute_pointer_type = tl.pointer_type(compute_dtype)
     state_dtype = _DTYPE2TRITON[MODEL_STATE_DTYPE.value]
     state_pointer_type = tl.pointer_type(state_dtype)
+    int_pointer_type = tl.pointer_type(tl.int32)
 
     state_param_ptr = tl.load(state_param_ptr_per_chunk + chunk_idx).to(state_pointer_type)
     swa_param_ptr = tl.load(swa_param_ptr_per_chunk + chunk_idx).to(state_pointer_type)
@@ -153,7 +156,8 @@ def _multi_tensor_adam_swa(
     velocity_ptr = tl.load(velocity_ptr_per_chunk + chunk_idx).to(state_pointer_type)
     compute_param_ptr = tl.load(compute_param_ptr_per_chunk + chunk_idx).to(compute_pointer_type)
     grad_ptr = tl.load(grad_ptr_per_chunk + chunk_idx).to(compute_pointer_type)
-    grad_clip_scale = tl.load(grad_clip_scale_ptr)
+    step_ptr = tl.load(step_ptr_per_chunk + chunk_idx).to(int_pointer_type)
+    swa_n_averaged_ptr = tl.load(swa_n_averaged_ptr_per_chunk + chunk_idx).to(int_pointer_type)
 
     ptr_base_offset = chunk_local_idx * CHUNK_SIZE
     state_param_ptr += ptr_base_offset
@@ -162,6 +166,15 @@ def _multi_tensor_adam_swa(
     grad_ptr += ptr_base_offset
     moment_ptr += ptr_base_offset
     velocity_ptr += ptr_base_offset
+
+    grad_clip_scale = tl.load(grad_clip_scale_ptr)
+    step = tl.load(step_ptr)
+    swa_n_averaged = tl.load(swa_n_averaged_ptr)
+    if bias_correction:
+        beta1_correction = 1.0 - tl.math.pow(beta1, step)
+        beta2_correction = 1.0 - tl.math.pow(beta2, step)
+    else:
+        beta1_correction = beta2_correction = 1.0
 
     for i in range(0, CHUNK_SIZE, BLOCK_SIZE):
         idx = i + tl.arange(0, BLOCK_SIZE)
@@ -201,12 +214,19 @@ def _multi_tensor_adam_swa(
         tl.store(velocity_ptr + idx, velocity, mask)
         tl.store(compute_param_ptr + idx, param, mask)
         tl.store(swa_param_ptr + idx, swa_param, mask)
+        # Write zeros to gradient tensors. This is particularly useful in CUDA Graph execution,
+        # where gradient tensor addresses are static and this saves many standalone .fill_(0) calls.
+        tl.store(grad_ptr + idx, 0, mask)
 
 
 # Note:
 # - Gradients are attached to BF16 tensors
 # - Assume all parameters are all updated at each step, i.e., they share the same step number
 class FusedAdamSWA(Optimizer):
+    # Default step numbers when starting from scratch.
+    _initial_opt_step = 0
+    _initial_swa_step = 0
+
     def __init__(
         self,
         params: List[nn.Parameter],
@@ -248,8 +268,6 @@ class FusedAdamSWA(Optimizer):
             raise ValueError("FusedAdamSWA expects all input params to be contiguous")
         if amsgrad:
             raise NotImplementedError("amsgrad is not supported by FusedAdamSWA")
-        if capturable:
-            raise NotImplementedError("capturable is not supported by FusedAdamSWA")
         if master_weights:
             raise NotImplementedError("master_weights is not supported by FusedAdamSWA")
         if not isinstance(adam_math_mode, AdamMathType):
@@ -271,11 +289,15 @@ class FusedAdamSWA(Optimizer):
         self.adam_math_mode = adam_math_mode
         self.set_grad_none = set_grad_none
         self.compute_param_groups = [{"params": compute_params}]
-        self.swa_param_groups = [{"params": swa_params, "n_averaged": 0}]
-        self.swa_decay_rate = swa_decay_rate
+        self.swa_param_groups = [{"params": swa_params, "swa_decay_rate": swa_decay_rate}]
+        self.capturable = capturable
 
         # We assume that parameter and buffer pointers won't change throughout the training, only
         # gradients could be re-allocated due to set_grad_none.
+        self._clear_pointer_buffers()
+
+    def _clear_pointer_buffers(self):
+        self.pointer_buffer_groups = None
         self._pointer_buffers_initialized = False
 
     def _build_pointer_buffers(self):
@@ -339,78 +361,133 @@ class FusedAdamSWA(Optimizer):
             device = params_this_group[0].device
             buffer_group["device"] = device
             buffer_group["chunks_per_param"] = chunks_per_param
-            buffer_group["chunk_local_idx"] = chunk_local_idx.to(device)
-            buffer_group["chunk_numel"] = chunk_numel.to(device)
-            buffer_group["param_ptr_per_chunk"] = param_ptr_per_chunk.to(device)
-            buffer_group["compute_param_ptr_per_chunk"] = compute_param_ptr_per_chunk.to(device)
-            buffer_group["swa_param_ptr_per_chunk"] = swa_param_ptr_per_chunk.to(device)
+            buffer_group["chunk_local_idx"] = chunk_local_idx.to(device, non_blocking=True)
+            buffer_group["chunk_numel"] = chunk_numel.to(device, non_blocking=True)
+            buffer_group["param_ptr_per_chunk"] = param_ptr_per_chunk.to(device, non_blocking=True)
+            buffer_group["compute_param_ptr_per_chunk"] = compute_param_ptr_per_chunk.to(
+                device, non_blocking=True
+            )
+            buffer_group["swa_param_ptr_per_chunk"] = swa_param_ptr_per_chunk.to(
+                device, non_blocking=True
+            )
             buffer_group["total_chunks"] = chunks_per_param.sum().item()
             buffer_group["default_grad_clip_scale"] = torch.tensor(1.0, dtype=state_dtype).to(
-                device
+                device, non_blocking=True
             )
 
-            # Build moment pointer buffers.
-            moment, velocity = [], []
-            for p in params_this_group:
+            # Build parameter state pointer buffers. Note that each parameter *element* has an
+            # associated moment and velocity entry, while each parameter *tensor* shares a step
+            # number.
+            moment, velocity, step, swa_n_averaged = [], [], [], []
+            step_tensors, swa_n_averaged_tensors = [], []
+            for i, p in enumerate(params_this_group):
                 state = self.state[p]
                 if "exp_avg" not in state or "exp_avg_sq" not in state:
                     state["exp_avg"] = torch.zeros_like(p.detach(), dtype=state_dtype)
                     state["exp_avg_sq"] = torch.zeros_like(p.detach(), dtype=state_dtype)
                 moment.append(state["exp_avg"].data_ptr())
                 velocity.append(state["exp_avg_sq"].data_ptr())
-            moment = torch.tensor(moment, dtype=torch.int64)
-            velocity = torch.tensor(velocity, dtype=torch.int64)
-            buffer_group["exp_avg_ptr_per_chunk"] = torch.repeat_interleave(
-                moment, chunks_per_param
-            ).to(device)
-            buffer_group["exp_avg_sq_ptr_per_chunk"] = torch.repeat_interleave(
-                velocity, chunks_per_param
-            ).to(device)
+
+                for key, init_val, pointers, tensors in zip(
+                    ("step", "swa_n_averaged"),
+                    (self._initial_opt_step, self._initial_swa_step),
+                    (step, swa_n_averaged),
+                    (step_tensors, swa_n_averaged_tensors),
+                ):
+                    if key not in state:
+                        state[key] = torch.tensor(init_val, dtype=torch.int32).to(
+                            device, non_blocking=True
+                        )
+                    elif (
+                        state[key].numel() != 1
+                        or state[key].dtype != torch.int32
+                        or state[key].device != device
+                    ):
+                        raise ValueError(
+                            f"Optimizer state #{i} has an illegal {key} tensor {state[key]}. "
+                            f"Expect a scalar INT32 tensor on {device}"
+                        )
+                    pointers.append(state[key].data_ptr())
+                    tensors.append(state[key])
+
+            for key, pointers in zip(
+                (
+                    "exp_avg_ptr_per_chunk",
+                    "exp_avg_sq_ptr_per_chunk",
+                    "step_ptr_per_chunk",
+                    "swa_n_averaged_ptr_per_chunk",
+                ),
+                (moment, velocity, step, swa_n_averaged),
+            ):
+                pointers = torch.tensor(pointers, dtype=torch.int64)
+                buffer_group[key] = torch.repeat_interleave(pointers, chunks_per_param).to(
+                    device, non_blocking=True
+                )
+            buffer_group["step_tensors"] = step_tensors
+            buffer_group["swa_n_averaged_tensors"] = swa_n_averaged_tensors
+
+            # In capturable mode, gradient tensors are static as well so we can pre-build their
+            # pointer buffers as well.
+            if self.capturable:
+                grad_ptr_per_chunk = self._build_grad_pointer_buffers(
+                    parameters=compute_params_this_group,
+                    device=device,
+                    chunks_per_param=chunks_per_param,
+                )
+                buffer_group["grad_ptr_per_chunk"] = grad_ptr_per_chunk
 
         self._pointer_buffers_initialized = True
+
+    def _build_grad_pointer_buffers(self, parameters, device, chunks_per_param):
+        grad_ptr_per_chunk = []
+        for i, p in enumerate(parameters):
+            if p.grad is None:
+                raise RuntimeError(f"#{i} parameter didn't have associated gradients")
+            elif p.grad.detach().is_sparse:
+                raise RuntimeError(
+                    f"{self.__class__.__name__} does not support sparse gradients, please "
+                    f"consider SparseAdam instead"
+                )
+            grad_ptr_per_chunk.append(p.grad.data_ptr())
+        grad_ptr_per_chunk = torch.tensor(grad_ptr_per_chunk, dtype=torch.int64)
+        grad_ptr_per_chunk = torch.repeat_interleave(
+            grad_ptr_per_chunk, chunks_per_param
+        ).to(device, non_blocking=True)
+
+        return grad_ptr_per_chunk
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        # No-op. This is done by Triton kernel epilogue.
+        return None
 
     def step(
         self,
         closure: Optional[Callable[[], torch.Tensor]] = None,
         grad_clip_scale: Optional[Union[torch.Tensor, float]] = None,
     ):
-        if not self._pointer_buffers_initialized:
-            self._build_pointer_buffers()
-
         loss = closure() if closure is not None else None
-
         group = self.param_groups[0]
         compute_group = self.compute_param_groups[0]
         swa_group = self.swa_param_groups[0]
-        if "step" in group:
-            group["step"] += 1
-        else:
-            group["step"] = 1
-        (beta1, beta2), step = group["betas"], group["step"]
-        if group["bias_correction"]:
-            beta1_correction = 1.0 - beta1**step
-            beta2_correction = 1.0 - beta2**step
-        else:
-            beta1_correction = beta2_correction = 1.0
+        beta1, beta2 = group["betas"]
 
-        grad_ptr = []
-        for p in compute_group["params"]:
-            if p.grad is None:
-                continue
-            if p.grad.detach().is_sparse:
-                raise RuntimeError(
-                    "FusedAdamSWA does not support sparse gradients, please consider SparseAdam instead"
-                )
-            grad_ptr.append(p.grad.data_ptr())
+        if not self._pointer_buffers_initialized:
+            self._build_pointer_buffers()
 
         for (compute_dtype, state_dtype), buffer_group in self.pointer_buffer_groups.items():
             device = buffer_group["device"]
             t_idx = buffer_group["tensor_idx"]
-            grad_ptr_this_group = [grad_ptr[i] for i in t_idx]
-            grad_ptr_this_group = torch.tensor(grad_ptr_this_group, dtype=torch.int64)
-            grad_ptr_per_chunk = torch.repeat_interleave(
-                grad_ptr_this_group, buffer_group["chunks_per_param"]
-            ).to(device, non_blocking=True)
+
+            # 1. Construct gradient pointer buffers in eager mode.
+            if self.capturable:
+                grad_ptr_per_chunk = buffer_group["grad_ptr_per_chunk"]
+            else:
+                grad_ptr_per_chunk = self._build_grad_pointer_buffers(
+                    parameters=[compute_group["params"][i] for i in t_idx],
+                    device=device,
+                    chunks_per_param=buffer_group["chunks_per_param"],
+                )
+            # 2. Move grad-clip scale to device in a non-blocking manner.
             if grad_clip_scale is None:
                 grad_clip_scale_this_group = buffer_group["default_grad_clip_scale"]
             elif not torch.is_tensor(grad_clip_scale):
@@ -419,6 +496,12 @@ class FusedAdamSWA(Optimizer):
                 )
             else:
                 grad_clip_scale_this_group = grad_clip_scale
+            # 3. Update Adam and SWA step numbers. These values will be fetched from per-chunk
+            # pointers in Triton kernel later. Note that we got to increase these step values before
+            # the main Triton kernel, as Adam math logic in each Triton program has data dependency
+            # on the updated step numbers.
+            torch._foreach_add_(buffer_group["step_tensors"], 1)
+            torch._foreach_add_(buffer_group["swa_n_averaged_tensors"], 1)
 
             grid = (buffer_group["total_chunks"],)
             _multi_tensor_adam_swa[grid](
@@ -428,6 +511,8 @@ class FusedAdamSWA(Optimizer):
                 grad_ptr_per_chunk=grad_ptr_per_chunk,
                 moment_ptr_per_chunk=buffer_group["exp_avg_ptr_per_chunk"],
                 velocity_ptr_per_chunk=buffer_group["exp_avg_sq_ptr_per_chunk"],
+                step_ptr_per_chunk=buffer_group["step_ptr_per_chunk"],
+                swa_n_averaged_ptr_per_chunk=buffer_group["swa_n_averaged_ptr_per_chunk"],
                 chunk_local_idx_ptr=buffer_group["chunk_local_idx"],
                 chunk_numel_ptr=buffer_group["chunk_numel"],
                 grad_clip_scale_ptr=grad_clip_scale_this_group,
@@ -436,11 +521,9 @@ class FusedAdamSWA(Optimizer):
                 beta2=beta2,
                 eps=group["eps"],
                 weight_decay=group["weight_decay"],
-                beta1_correction=beta1_correction,
-                beta2_correction=beta2_correction,
-                swa_decay_rate=self.swa_decay_rate,
-                swa_n_averaged=swa_group["n_averaged"],
+                swa_decay_rate=swa_group["swa_decay_rate"],
                 adam_math_mode=self.adam_math_mode.value,
+                bias_correction=group["bias_correction"],
                 MODEL_COMPUTE_DTYPE=_TORCH2DTYPE[compute_dtype],
                 MODEL_STATE_DTYPE=_TORCH2DTYPE[state_dtype],
                 # TODO: Find optimal hyper-parameters.
@@ -448,8 +531,6 @@ class FusedAdamSWA(Optimizer):
                 BLOCK_SIZE=128,
                 num_warps=1,
             )
-
-        swa_group["n_averaged"] += 1
 
         return loss
 
@@ -461,6 +542,7 @@ class FusedAdamSWA(Optimizer):
         bf16_params: List[nn.Parameter],
         swa_params: List[nn.Parameter],
         swa_decay_rate: float,
+        capturable: bool,
     ) -> FusedAdamSWA:
         assert len(adam_optimizer.param_groups) == 1
         param_group = adam_optimizer.param_groups[0]
@@ -480,15 +562,13 @@ class FusedAdamSWA(Optimizer):
             weight_decay=weight_decay,
             amsgrad=amsgrad,
             adam_math_mode=AdamMathType.PyTorchAdam,
+            capturable=capturable,
         )
         adam_state_dict = adam_optimizer.state_dict()
         adam_state_dict["param_groups"][0].setdefault("bias_correction", True)
-        steps = [v["step"] for v in adam_state_dict["state"].values()]
-        if len(steps) == 0:  # Did not load optimizer checkpoint.
-            steps = [torch.tensor(1)]
-        elif not all(s == steps[0] for s in steps):
-            raise ValueError("FusedAdamSWA requires all parameters were updated by same steps!")
-        step = int(steps[0].item())
-        adam_state_dict["param_groups"][0].setdefault("step", step)
+        # Cast step tensors to int32. This helps Triton to generate faster math.pow instructions.
+        for s in adam_state_dict["state"].values():
+            if "step" in s:
+                s["step"] = s["step"].to(torch.int32)
         fused_adam_swa_optimizer.load_state_dict(adam_state_dict)
         return fused_adam_swa_optimizer
